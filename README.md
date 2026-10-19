@@ -1,117 +1,106 @@
-# SIS – URL Analyzer
+# SIS – Expression Calculator
 
-My Checkpoint 1 project for the Go course. It's a small program that takes a URL,
-checks that it makes sense, breaks it into parts, and tells you if anything looks risky.
-Everything lives in memory, and nothing runs concurrently yet.
+A small Go program that calculates math expressions. You create a task with an
+expression like `2 + 3 * (4 - 1)`, process it, and get the answer, plus the expression
+rewritten in postfix form (how the computer actually evaluates it). Everything is stored
+in memory.
 
-## What's a "task" here?
-
-One task = one URL to analyze. You give the app a URL, it stores it as a task, and later
-you tell it to process that task. Processing fills in the result.
-
-For example, `http://admin:pw@192.168.0.10:8080/login?token=abc` gives:
+## Example
 
 ```
-scheme=http  host=192.168.0.10  port=8080  path=[login]  query={token: [abc]}
-warning: uses unencrypted http
-warning: contains credentials in the URL
-warning: non-default port 8080
-warning: host is a raw IP address
-warning: sensitive query parameter "token"
+Input:    2 + 3 * (4 - 1)
+Result:   11
+Postfix:  2 3 4 1 - * +
 ```
 
-I picked this domain because it's easy to test (the same input always gives the same
-output) and it uses Go's standard library only (`net/url`, `net/netip`).
+What it understands:
 
-### What counts as invalid input
-
-- empty or whitespace-only text
-- something that doesn't parse as a URL
-- a scheme other than `http` / `https` (so `ftp://...` and plain `example.com` are out)
-- no host (`https:///path`)
-- a port outside 1–65535
-
-Invalid URLs are rejected when you create the task, so they never get stored.
+- numbers, including decimals: `3.5`
+- `+`  `-`  `*`  `/`  `^` (power)
+- parentheses: `(2 + 3) * 4`
+- negative numbers: `-5`, `-(1 + 2)`, `2 ^ -1`
+- normal math rules: `*` and `/` before `+` and `-`, left to right for `10 - 4 - 3`,
+  and `2 ^ 3 ^ 2` is `2 ^ 9` = 512 (power goes right to left)
 
 ## Task lifecycle
 
 ```
 Pending ──► Processing ──► Completed
-                 │
-                 └──────► Failed
+                │
+                └───────► Failed
 ```
 
-| State        | Meaning                                   | Can go to             |
-|--------------|-------------------------------------------|-----------------------|
-| `pending`    | created, not processed yet                | `processing`          |
-| `processing` | the analyzer is running                   | `completed`, `failed` |
-| `completed`  | done, the result is attached              | nothing (final)       |
-| `failed`     | the analyzer returned an error            | nothing (final)       |
+| State        | Meaning                                  | Next state              |
+|--------------|------------------------------------------|-------------------------|
+| `pending`    | created, not calculated yet              | `processing`            |
+| `processing` | being calculated right now               | `completed` or `failed` |
+| `completed`  | done, the result is attached             | none                    |
+| `failed`     | the calculation hit a math error         | none                    |
 
-Anything else is rejected with an `ErrInvalidTransition` error and the task stays as it
-was. For example, you can't process the same task twice.
+Any other change is an error. For example, processing a completed or failed task again
+returns `ErrInvalidState` and leaves the task as it was.
 
-`failed` isn't strictly needed right now, because the URL is validated before the task
-exists. I kept it because the analyzer is an interface and some other implementation
-could still fail while processing.
+## Two kinds of errors
 
-## How to run it
+1. **Bad syntax** is rejected when you create the task, so it is never stored.
+   Examples: empty text, `1 +`, `(1 + 2`, `2 3`, `2 & 3`.
+2. **Math errors** can only be found while calculating, so they happen during processing
+   and the task becomes `failed` (with the reason saved in `Err`).
+   Examples: `1 / 0`, `0 ^ -1`, `(-8) ^ 0.5`, `10 ^ 400`.
 
-You need Go 1.27.
+That is why `1 / 0` can be created, but processing it fails.
+
+## Run
+
+Needs Go 1.27.
 
 ```bash
-go run ./cmd/sis      # small demo: creates, processes and prints a few tasks
-go test ./...         # run the tests
+go run .                         # demo with some built-in expressions
+go run . "2 * (3 + 4)" "1 / 0"   # or give your own expressions
+go test ./...
 go vet ./...
-gofmt -l .            # prints nothing if everything is formatted
+gofmt -l .
 ```
 
-## How the code is organized
+## Files
 
-```
-cmd/sis/            the demo program
-internal/task/      Task, Status, Result and the lifecycle rules
-internal/analyzer/  the Analyzer interface and the URL analyzer
-internal/store/     the Store interface and an in-memory version
-internal/service/   Create, Get, List and Process – ties everything together
-```
+| File                 | What is in it |
+|----------------------|---------------|
+| `task.go`            | `Task`, `Result`, `Status`, and the state changes (`start`, `finish`, `fail`) |
+| `calculator.go`      | the `Evaluator` interface and `Calculator`: parsing and calculating |
+| `manager.go`         | `Manager`: create, get, list and process tasks, stored in a map |
+| `main.go`            | the demo |
+| `calculator_test.go` | tests for parsing and calculating |
+| `manager_test.go`    | tests for the task lifecycle |
 
-The service talks to the analyzer and the store only through interfaces. That's mostly so
-I can swap in a fake analyzer in tests, and so a real database or a different kind of task
-could be plugged in later without touching the lifecycle code.
+## How it works
 
-A few decisions worth knowing about:
+1. **Parsing.** The text is read left to right and converted to postfix notation with the
+   shunting-yard algorithm. This also finds all the syntax errors.
+2. **Calculating.** The postfix list is evaluated with a stack: a number is pushed, an
+   operator takes the top numbers off the stack and pushes the answer.
 
-- **Status changes only happen through methods on the task** (`Start`, `Complete`,
-  `Fail`). They check a small transition table, so nothing can put a task into a state it
-  shouldn't be in.
-- **The store gives out copies.** If you get a task and change it, the stored one doesn't
-  change unless you save it back. That's what keeps tasks from affecting each other.
-- **`Process` saves the `processing` state before it runs the analyzer**, so the state
-  reflects what's actually happening and not just a local variable.
-- **IDs** are `task-1`, `task-2`, ... A rejected URL doesn't use up a number.
-- **Errors are returned, never panicked.** They're wrapped with `%w`, so you can check them
-  with `errors.Is`.
-- **No locks.** The store isn't safe for concurrent use. Concurrency isn't part of this
-  checkpoint, so I left it out on purpose.
+## Design
 
-There's a longer walkthrough of the code in [CODE_EXPLANATION.md](CODE_EXPLANATION.md).
+- `Manager` depends on the `Evaluator` interface, so the calculator can be replaced.
+- Tasks live in a `map[int]*Task`. IDs are 1, 2, 3, ... and a rejected expression does not
+  use up an ID.
+- The state only changes through `start()`, `finish()` and `fail()`, and each one checks
+  the current state first.
+- Errors are returned (never `panic`) and wrapped with `%w`, so they can be checked with
+  `errors.Is`.
 
 ## Tests
 
-Only the standard `testing` package. Table-driven tests are used for URL validation,
-analysis results, and invalid state transitions.
+| Spec requirement             | Test |
+|------------------------------|------|
+| Creating a task              | `TestCreate` |
+| Invalid input                | `TestCreateInvalidInput`, `TestCheckRejectsBadSyntax` (table-driven) |
+| Getting a task               | `TestGet` |
+| Task that does not exist     | `TestGetMissing`, `TestProcessMissing` |
+| Processing and result        | `TestProcess`, `TestEvaluate` (table-driven) |
+| State after processing       | `TestProcess`, `TestProcessFailure` |
+| Invalid operation            | `TestProcessTwiceIsRejected`, `TestInvalidStateTransitions` (table-driven) |
+| Several independent tasks    | `TestMultipleTasksAreIndependent` |
 
-| What the spec asks for            | Where it's tested |
-|-----------------------------------|-------------------|
-| Creating a task                   | `service.TestCreate` |
-| Invalid input                     | `service.TestCreateInvalidInput`, `analyzer.TestValidate` |
-| Getting a task                    | `service.TestGet`, `store.TestAddAndGet` |
-| Getting a task that doesn't exist | `service.TestGetMissing`, `store.TestGetMissing` |
-| Processing and the result         | `service.TestProcess`, `analyzer.TestAnalyze` |
-| State after processing            | `service.TestProcess`, `service.TestTaskIsProcessingWhileAnalyzing` |
-| Invalid operation                 | `service.TestProcessTwiceIsRejected`, `task.TestInvalidTransitions` |
-| Several independent tasks         | `service.TestMultipleTasksAreIndependent`, `store.TestStoreReturnsCopies` |
-
-There's also a test for the `failed` path (`service.TestAnalyzerFailureMarksTaskFailed`),
-which uses a fake analyzer that always returns an error.
+More detail about the code is in [CODE_EXPLANATION.md](CODE_EXPLANATION.md).
